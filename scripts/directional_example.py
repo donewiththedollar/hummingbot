@@ -34,7 +34,7 @@ class DirectionalExample(ScriptStrategyBase):
     # threshold to accept the signal and increase the position
     ENTRY_THRESHOLD = 0.6
     # threshold to reduce the position
-    EXIT_THRESHOLD = 0.3
+    EXIT_THRESHOLD = 0.2
     # take profit in percentage (1% = 0.01)
     TAKE_PROFIT = 0.03
     # stop loss in percentage (1% = 0.01)
@@ -42,14 +42,25 @@ class DirectionalExample(ScriptStrategyBase):
     # last signal time to evaluate with time between signals
     last_signal_time = 0
     # signal stats
-    signals = pd.DataFrame(columns=["signal", "order_id", "price", "amount", "tp_price", "sl_price"])
+    # Index: Signal ID
+    # Open Order ID: ID of the order that increase or decrease the position
+    # Price: Execution price of the order
+    # Amount: Excecution amount of the order
+    # TP_price: Price * (1 + TAKE_PROFIT)
+    # SL_price: Price * (1 - STOP_LOSS)
+    # Status: [TP, SL, ACTIVE, CANCELED]
+    # Close Order ID: Order ID that closes the position
+    signals = pd.DataFrame(columns=["signal", "open_order_id", "price", "amount", "tp_price", "sl_price", "status", "close_order_id"])
 
     def on_tick(self):
+        # Check active signals and review if it's necessary to create a take profit order or a stop loss market order
+        self.update_active_signals()
         # Check if it is time to get a new signal
         if self.last_signal_time < (self.current_timestamp - self.TIME_BETWEEN_SIGNALS):
             self.last_signal_time = self.current_timestamp
             # get the signal
             signal = self.get_signal()
+            signal_id = len(self.signals.index)
             # get current balance in base amount
             amount_base = self.get_balance(self.EXCHANGE, self.BASE)
             order_id = pd.NA
@@ -67,7 +78,7 @@ class DirectionalExample(ScriptStrategyBase):
                         is_maker=True,
                         amount=Decimal(amount_to_buy)
                     )
-
+                    self.signals.loc[signal_id] = [signal, order_id, pd.NA, pd.NA, 0, 0, "ACTIVE", pd.NA]
             elif signal < self.EXIT_THRESHOLD:
                 self.logger().info(f"Signal < EXIT THRESHOLD {self.EXIT_THRESHOLD} ==> TRY TO DECREASE POSITION")
                 # check if the current balance is higher than the min position and
@@ -82,12 +93,28 @@ class DirectionalExample(ScriptStrategyBase):
                         is_maker=True,
                         amount=Decimal(amount_to_sell)
                     )
-
-            self.signals.loc[len(self.signals.index)] = [signal, order_id, pd.NA, pd.NA, pd.NA, pd.NA]
+                    # Close the active signal with the higher buy price
+                    signal_to_remove = self.signals[self.signals["status"] == "ACTIVE"].argmax()
+                    self.signals.loc[signal_to_remove, ["status", "close_order_id"]] = ["CANCELED", order_id]
+                    self.signals.loc[signal_id] = [signal, order_id, pd.NA, pd.NA, 0, 0, pd.NA, pd.NA]
+            else:
+                self.signals.loc[signal_id] = [signal, order_id, pd.NA, pd.NA, pd.NA, pd.NA, pd.NA, pd.NA]
 
     @staticmethod
     def get_signal():
         return random.normal(loc=0.6, scale=0.25)
+
+    def update_active_signals(self):
+        active_signals = self.signals[self.signals["status"] == "ACTIVE"]
+        best_ask = self.connectors[self.EXCHANGE].get_price(self.TRADING_PAIR, True)
+        best_bid = self.connectors[self.EXCHANGE].get_price(self.TRADING_PAIR, False)
+        for idx, signal in active_signals.iterrows():
+            if signal["tp_price"] >= best_bid:
+                order_id = self.buy(self.EXCHANGE, self.TRADING_PAIR, Decimal(self.ORDER_SIZE), OrderType.MARKET, best_bid)
+                self.signals.loc[idx, ["status", "close_order_id"]] = ["TP", order_id]
+            if signal["sl_price"] <= best_ask:
+                order_id = self.sell(self.EXCHANGE, self.TRADING_PAIR, Decimal(self.ORDER_SIZE), OrderType.MARKET, best_ask)
+                self.signals.loc[idx, ["status", "close_order_id"]] = ["SL", order_id]
 
     def format_status(self) -> str:
         """
@@ -110,7 +137,7 @@ class DirectionalExample(ScriptStrategyBase):
             lines.extend(["", "  No active maker orders."])
 
         lines.extend(["", "  Signals:"] + ["    " + line for line in
-                                           self.signals[["signal", "order_id", "price"]].to_string(index=False).split(
+                                           self.signals[["signal", "price", "tp_price", "sl_price", "status"]].to_string(index=False).split(
                                                "\n")])
         warning_lines.extend(self.balance_warning(self.get_market_trading_pair_tuples()))
         if len(warning_lines) > 0:
@@ -158,12 +185,12 @@ class DirectionalExample(ScriptStrategyBase):
         """
         Method called when the connector notifies a buy order has been completed (fully filled)
         """
-        amount = event.base_asset_amount
-        price = event.quote_asset_amount / event.base_asset_amount
-        tp_price = price * Decimal(1 + self.TAKE_PROFIT)
-        sl_price = price * Decimal(1 - self.STOP_LOSS)
+        amount = round(event.base_asset_amount, 2)
+        price = round(event.quote_asset_amount / event.base_asset_amount, 2)
+        tp_price = round(price * Decimal(1 + self.TAKE_PROFIT), 2)
+        sl_price = round(price * Decimal(1 - self.STOP_LOSS), 2)
 
-        self.signals.loc[self.signals["order_id"] == event.order_id, ["amount", "price", "tp_price", "sl_price"]] = [
+        self.signals.loc[self.signals["open_order_id"] == event.order_id, ["amount", "price", "tp_price", "sl_price"]] = [
             amount, price, tp_price, sl_price]
         self.logger().info(f"The buy order {event.order_id} has been completed")
 
@@ -171,11 +198,11 @@ class DirectionalExample(ScriptStrategyBase):
         """
         Method called when the connector notifies a sell order has been completed (fully filled)
         """
-        amount = event.base_asset_amount
-        price = event.quote_asset_amount / event.base_asset_amount
+        amount = round(event.base_asset_amount, 2)
+        price = round(event.quote_asset_amount / event.base_asset_amount, 2)
         tp_price = pd.NA
         sl_price = pd.NA
 
-        self.signals.loc[self.signals["order_id"] == event.order_id, ["amount", "price", "tp_price", "sl_price"]] = [
+        self.signals.loc[self.signals["open_order_id"] == event.order_id, ["amount", "price", "tp_price", "sl_price"]] = [
             amount, price, tp_price, sl_price]
         self.logger().info(f"The sell order {event.order_id} has been completed")
